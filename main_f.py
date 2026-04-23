@@ -14,17 +14,11 @@ from langchain_core.messages import HumanMessage, AIMessage
 from rag_agent_mistral import create_rag_agent
 
 load_dotenv()
-
-# ── Configuration LangSmith ──────────────────────────────────────
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_PROJECT"] = "RAG_Mistral_Chat"
-os.environ["LANGSMITH_API_KEY"] = os.getenv("LANGSMITH_API_KEY", "")
-
 agent = create_rag_agent()
-
 # ── App Configuration ─────────────────────────────────────────────
 app = FastAPI(title="Weather Agent API (Mistral AI)")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 # ── Schemas & Routes ───────────────────────────────────────────────
 class ChatRequest(BaseModel):
@@ -33,9 +27,6 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    """Chat endpoint avec monitoring LangSmith"""
-    print(f"[LOG] Message reçu : {req.message}")
-    
     # Conversion historique simple
     hist = []
     for m in req.history:
@@ -45,26 +36,12 @@ def chat(req: ChatRequest):
             hist.append(AIMessage(content=m['content']))
             
     try:
-        result = agent.invoke({
-            "messages": [HumanMessage(content=req.message)]
-        })
-        
-        response = result["messages"][-1].content
-        print(f"[LOG] Réponse : {response}")
-        
-        return {"response": response}
+        result = agent.invoke({"messages": [HumanMessage(content=req.message)]})
+        return {"response": result["messages"][-1].content}
     except Exception as e:
         print(f"[SERVER ERROR] {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-def health():
-    """Health check"""
-    return {"status": "ok", "monitoring": "LangSmith enabled"}
-
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 API démarrée")
-    print(f"📊 LangSmith Project : RAG_Mistral_Chat")
     uvicorn.run(app, host="127.0.0.1", port=8000)
-    
