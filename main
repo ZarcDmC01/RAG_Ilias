@@ -1,0 +1,155 @@
+import json
+import os
+import httpx
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Langchain core pour la structure
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage
+
+load_dotenv()
+
+# ── App Configuration ─────────────────────────────────────────────
+app = FastAPI(title="Weather Agent API (Mistral AI)")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ── Weather Tool ──────────────────────────────────────────────────
+@tool
+def get_weather(city: str) -> str:
+    """Get the current weather for a given city."""
+    weather_db = {
+        "paris": "☀️ Paris: 22°C, ensoleillé",
+        "london": "🌧️ London: 14°C, pluie légère",
+        "new york": "⛅ New York: 18°C, nuageux",
+        "tokyo": "🌤️ Tokyo: 26°C, beau temps",
+        "dubai": "🔥 Dubai: 38°C, très chaud",
+    }
+    return weather_db.get(city.strip().lower(), f"🌡️ {city}: 20°C (données simulées)")
+
+TOOLS_MAP = {"get_weather": get_weather}
+
+# Schéma spécifique Mistral (similaire à OpenAI)
+TOOLS_SCHEMA = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a given city.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "The city name"}
+            },
+            "required": ["city"]
+        }
+    }
+}]
+
+SYSTEM_PROMPT = "Tu es un assistant météo intelligent. Réponds toujours en français."
+
+# ── Appel Mistral via httpx ───────────────────────────────────────
+def call_mistral(messages: list) -> dict:
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        raise ValueError("MISTRAL_API_KEY manquante dans le .env")
+    
+    payload = {
+        "model": "mistral-large-latest", # Modèle performant pour les outils
+        "messages": messages,
+        "tools": TOOLS_SCHEMA,
+        "tool_choice": "auto",
+        "temperature": 0.3
+    }
+    
+    response = httpx.post(
+        "https://api.mistral.ai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=30
+    )
+    
+    if response.status_code != 200:
+        print(f"[MISTRAL ERROR] {response.text}")
+        response.raise_for_status()
+        
+    return response.json()
+
+# ── Boucle de l'Agent ──────────────────────────────────────────────
+def run_agent(user_msg: str, history: list) -> dict:
+    # Initialisation
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    # Historique
+    for m in history:
+        role = "user" if isinstance(m, HumanMessage) else "assistant"
+        messages.append({"role": role, "content": m.content or ""})
+    
+    # Nouvelle question
+    messages.append({"role": "user", "content": user_msg})
+
+    tool_used = None
+
+    for _ in range(5):
+        res = call_mistral(messages)
+        message_obj = res["choices"][0]["message"]
+        
+        # Si Mistral veut appeler un outil
+        tool_calls = message_obj.get("tool_calls")
+        
+        if not tool_calls:
+            return {"output": message_obj.get("content") or "", "tool_used": tool_used}
+
+        # Ajouter l'intention de l'assistant à l'historique
+        messages.append(message_obj)
+
+        for tc in tool_calls:
+            t_name = tc["function"]["name"]
+            t_args = json.loads(tc["function"]["arguments"])
+            tool_used = t_name
+
+            print(f"[DEBUG] Mistral appelle l'outil : {t_name} avec {t_args}")
+            
+            # Exécution
+            t_res = TOOLS_MAP[t_name].invoke(t_args)
+
+            # Retour du résultat à Mistral
+            messages.append({
+                "role": "tool",
+                "name": t_name,
+                "tool_call_id": tc["id"],
+                "content": str(t_res)
+            })
+
+    return {"output": "Désolé, je n'ai pas pu terminer la requête.", "tool_used": tool_used}
+
+# ── Schemas & Routes ───────────────────────────────────────────────
+class ChatRequest(BaseModel):
+    message: str
+    history: Optional[List[dict]] = []
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    # Conversion historique simple
+    hist = []
+    for m in req.history:
+        if m.get('role') == 'user':
+            hist.append(HumanMessage(content=m['content']))
+        else:
+            hist.append(AIMessage(content=m['content']))
+            
+    try:
+        result = run_agent(req.message, hist)
+        return {"response": result["output"], "tool_used": result["tool_used"]}
+    except Exception as e:
+        print(f"[SERVER ERROR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
